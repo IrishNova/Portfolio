@@ -1,0 +1,213 @@
+import pymongo as mg
+import requests
+from datetime import datetime
+import pandas as pd
+
+
+def iex_price(tkr):
+    """
+    Accesses the live price of a stock using IEX Cloud api. Key is required.
+    :param tkr: str()
+    :return: float()
+    """
+    token = "<Your Key Here>"
+    ppp = f'https://cloud.iexapis.com/stable/stock/{tkr}/price/?token={token}'
+    return requests.get(ppp).json()
+
+
+class WorkingDB:
+
+    def __init__(self, name):
+        client = mg.MongoClient("mongodb://localhost:27017/")
+        self.db = client["{}".format(name)]
+
+        """Collections """
+        self.buy_log = self.db['BuyLog']
+        self.sell_log = self.db['SellLog']
+        self.open_positions = self.db['OpenPositions']
+        self.balance = self.db["balance"]
+        self.available = self.db["AvailableBalance"]
+        self.strategies = self.db["Strategies"]
+
+    def available_balance_update(self, nu):
+        """
+        Updates the amount of money available to purchase assets. Make sure to feed a negative number for the purchase,
+        and a positive for the sale, into this function.
+        :param nu: float(), added from a sale, subtracted from a purchase
+        :return: None
+        """
+        try:
+            am = self.available.find().sort("Date", -1)[0]['Balance']
+            udb = am + nu
+        except IndexError:
+            udb = nu
+
+        expt = {"Date": datetime.now(), "Balance": udb}
+        self.available.insert_one(expt) #TODO does this function need to exist?
+
+    def avb_retrieve(self):
+        """
+        Retrieves the figure for current avaible funds
+        :return: float()
+        """
+        return self.available.find().sort("Date", -1)[0]
+
+    def open_book(self, bs=None, d=None):
+        """
+        Adds and deletes entries into the ledger of open positions.
+        :param bs: if 1 function is adding, if 0 function is deleting
+        :param d: if bs = 1: dict = {"Ticker": 'Ticker Symbol',
+                                     "Shares": int(),
+                                     "Buy Ticket": '_id from entry in BuyLog Collection'}
+        :return: if 1, None if 0, str() "Buy Ticket"
+        """
+        if bs == 1:
+            self.open_positions.insert_one(d)
+        if bs == 0:
+            gone = self.open_positions.find_one({"Ticker": d})
+            self.open_positions.delete_one(gone)
+            return gone["BuyTicket"]
+
+    def balance_updater(self, money):
+        """
+        Adds the new balance and date of update to balance Collection.
+        :param money: float() positive for sale, negative for purchase
+        :return: None
+        """
+        try:
+            cb = self.balance.find().sort("Date", -1)[0]
+            bn = cb["Balance"]
+            new = bn + money
+            export = {"Date": datetime.now(), "Balance": new}
+            self.balance.insert_one(export)
+        except IndexError:
+            self.balance.insert_one(money)
+
+    def buy(self, b):
+        """
+        Logs the purchase of a position in the buy_log Collection. Calls open_book() and creates new
+        open book entry, including the _id from the buy_log Collection so that the transaction is
+        matched with the sell.
+        :param b: dict = {"Date": datetime object,
+                          "Ticker": 'Ticker Symbol',
+                          "NumberofShares": float(),
+                          "BuyPrice": float()
+                          }
+        :return: None
+        """
+
+        # Adds new buy ticket
+        self.buy_log.insert_one(b)
+
+        # creates an open book position
+        b["BuyTicket"] = self.buy_log.find_one({}, {"Date": b["Date"], "Ticker": b["Ticker"]})['_id']
+        self.open_book(1, b)
+
+        # Updates Balance
+        deduction = (b["NumberofShares"] * b["BuyPrice"]) * -1  # it's negative bc of balance_updater uses +
+        self.balance_updater(deduction)
+        self.available_balance_update(deduction)
+
+    def sell(self, s):
+        """
+        Logs the sale of a position in the sell_log Collection and matches buys to sells using "Buy ticket"
+        :param s: str() Ticker
+        :return: None
+        """
+        look = self.open_positions.find({"Ticker": s[0]})
+        export = {"Date": datetime.now(),
+                  "Ticker": s[0],
+                  "Price": iex_price(s[0]),
+                  "Shares": look['NumberofShares'],
+                  "BuyTicket": look['BuyTicket']}
+        self.sell_log.insert_one(export)
+        self.balance_updater(export['Price'] * export['NumberofShares'])
+        self.available_balance_update(export['Price'] * export['NumberofShares'])
+
+    def clear_book(self):
+        """Closes all open positions. Because the strategy explicit states a sell at close the day after purchase,
+        this must be called first before starting the day's purchases. It will sell all holdings and update all fields,
+        including the current balance when is necessary for allocation of purchases"""
+        try:
+            df = pd.DataFrame(self.open_positions.find())
+            if len(df) == 0:
+                return ["None"]
+            else:
+                print("Clear Book Called")
+                export = [x for x in df.Ticker]
+                df["SellPrice"] = [iex_price(x) for x in df.Ticker]
+                df["Total"] = df.SellPrice * df['NumberofShares']
+                df = df.drop("_id", axis=1)
+                for i in range(len(df)):
+                    temp = dict(df.iloc[i])
+                    self.sell(temp)
+                self.open_positions.drop()
+                return export
+        except IndexError:
+            pass
+
+    def log_create(self, pathway):
+        """
+        Generates Txt file, logging the day's positions.
+        :return:
+        """
+        df = pd.DataFrame(self.open_positions.find())
+        df.to_csv("{0}_{1}.csv".format(pathway, datetime.now()))
+
+    def strategy_logger(self, strat):
+        """
+        Inserts dict containing the strategy into Strategies Collection.
+        :param strat: dict {"Ticker": str(),
+                            "Odds": float(),
+                            "Model Type": str(),
+                            "Model Details": [float(), float()]
+                            ""
+        :return:
+        """
+        self.strategies.insert_one(strat)
+
+    def strategy_retriever(self, tick):
+        """
+        Returns dict of strategy
+        :param tick: str() containing TICKER
+        :return: dict
+        """
+        return self.strategies.find_one({"Ticker": tick})
+
+    def reset_database(self):
+        """Dummy Data"""
+        bsd = [{"Date": datetime.now(),
+                "Ticker": 'AAPL',
+                "NumberofShares": 10.00,
+                "BuyPrice": 34.29
+                },
+               {"Date": datetime.now(),
+                "Ticker": 'MSFT',
+                "NumberofShares": 15.00,
+                "BuyPrice": 221.99
+                },
+               {"Date": datetime.now(),
+                "Ticker": 'GM',
+                "NumberofShares": 30.00,
+                "BuyPrice": 35.29
+                }]
+
+        # """Reset Database"""
+        # client.drop_database('<Manually Enter Name>')
+
+        """Reset balance"""
+        self.balance.drop()
+        bal_exp = {"Date": datetime.now(),
+                   "Balance": 10000.00}
+        self.balance_updater(bal_exp)
+
+        self.available.drop()
+        self.available_balance_update(10000.00)
+
+        self. buy_log.drp()
+        self.sell_log.drop()
+        self.open_positions.drop()
+
+        # [buy(x) for x in bsd]
+
+x = WorkingDB("InterfaceTest")
