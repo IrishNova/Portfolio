@@ -1,0 +1,164 @@
+"""
+Checks for quantitative conditions to be True and makes a paper purchase of an asset, logging
+all the information into a database.
+"""
+
+import yfinance as yf
+from datetime import datetime as dt
+import datetime as datetime
+import requests
+import math
+
+from SimulationDatabaseController import WorkingDB
+from MACD_Mod import MacdSetup
+
+
+def iex_price(tkr):
+    token = "pk_6c88c066429a49f6bcb3d6a2e359fc10"
+    ppp = f'https://cloud.iexapis.com/stable/stock/{tkr}/price/?token={token}'
+    return requests.get(ppp).json()
+
+
+def stock_fetch(caller, period=365):
+    """
+    Gets historical data for a specified period of euqities's ticker
+    :param caller: Ticker
+    :param period: number of days
+    :return: dataframe with OHLCV data
+    """
+    now = dt.now()
+    past = now - datetime.timedelta(days=period)
+    return yf.download(['{}'.format(caller)], past, now)
+
+
+def fractal_screener(sd):
+    if len(sd) == 0:
+        marker = True
+    else:
+        marker = False
+        for i in range(len(sd) - 1):
+            yesterday = (sd.Close.iloc[i])
+            today = sd.Close.iloc[i + 1]
+            if today < yesterday:
+                marker = False
+                break
+            else:
+                marker = True
+
+    return marker
+
+
+class CheckPositions:
+
+    def __init__(self, portfolio):
+        self.name = portfolio
+        self.x = WorkingDB(portfolio)
+        self.x.clear_book()
+        self.buyt = []
+
+    def ticker_screener(self, tick):
+        """
+        Checks to see if ticker is already logged into self.buyt list().
+        :param tick: ticker
+        :return: None
+        """
+        if tick in self.buyt:
+            pass
+        else:
+            self.buyt.append(tick)
+
+    def lowrance_elite(self, ticker, fractal_period, macd):
+        """
+        This one's for the MACD condition. NOT the volume.
+        This looks for fish. You feed in the conditions for the fractal period
+        and the macd variables and it tells you if the stock is worth buying, today.
+        The fractal period is an int. The macd is a list of three ints [1, 2, 3].
+        And of course, the ticker is the stock.
+        :param ticker: str
+        :param fractal_period: int
+        :param macd: list [1, 2, 3]
+        :return: True if the stock should be purchased, False if it's a pass.
+        """
+
+        data = stock_fetch(ticker)
+        mds = MacdSetup(data, macd[0], macd[1], macd[2])
+        sd = data.tail(fractal_period).copy()
+        marker = fractal_screener(sd)
+        second = mds.macd_model(-1)
+
+        if marker and second is True:
+            self.ticker_screener(ticker)
+        else:
+            pass
+
+    def humminbird(self, ticker, fractal_period, vol_marker):
+        """
+        Volume/Fractal based strategy.
+        :param ticker:
+        :param fractal_period:
+        :param vol_marker:
+        :return:
+        """
+
+        data = stock_fetch(ticker)
+        volume_metric = data.Volume.mean() + (data.Volume.std() / vol_marker)
+        sd = data.tail(fractal_period).copy()
+        marker = fractal_screener(sd)
+
+        if data.Volume.iloc[-1] > volume_metric and marker is True:
+            self.ticker_screener(ticker)
+        else:
+            pass
+
+    def buySell(self):
+        meow = self.x.strat_keys()
+        for mo in meow:
+            hold = mo['Description']
+            sep = hold.split("__")
+            if len(sep) == 1:  # Fractal/Volume
+                broke = sep[0].split("_")
+                tick = (broke[0].split('"')[1])
+                fp = int(broke[-2])
+                v1 = (broke[-1].split('"'))
+                vol = int(v1[0])
+                self.humminbird(tick, fp, vol)
+            else:  # MACD
+                pass
+                tick = (sep[0].split("_")[0].split('"')[1])
+                fp = int(sep[0].split("_")[-1])
+                mac_hold = sep[-1].split("_")
+                one = int(mac_hold[0])
+                two = int(mac_hold[1])
+                three = int((mac_hold[2].split('"')[0]))
+                self.lowrance_elite(tick, fp, [one, two, three])
+        self.cast_a_line()
+        print("Daily Update for {} Complete".format(self.name))
+
+    def cast_a_line(self):
+        """
+        Takes all the tickers in self.buyt, divides the balance in the test account by that number, and then figures
+        out how many shares of each company to purchase. Logs that into a dict and then triggers the buy function in
+        the TestPortfolio. Finally, it creates a csv log of the daily activity by calling log_create().
+        :return:
+        """
+        bal = self.x.avb_retrieve()['Balance']
+        if len(self.buyt) == 0:
+            pass
+        else:
+            segment = round(bal / len(self.buyt), -1)
+            for t in self.buyt:
+                pps = iex_price(t)
+                nos = float(math.trunc(segment / pps))
+                export = {"Date": dt.now(),
+                          "Ticker": t,
+                          "NumberofShares": nos,
+                          "BuyPrice": pps}
+                self.x.buy(export)
+        # self.x.log_create()
+
+
+if __name__ == "__main__":
+    x = CheckPositions("AllStar")
+    x.buySell()
+    y = CheckPositions("ShotGun")
+    y.buySell()
