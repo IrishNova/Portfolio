@@ -1,0 +1,127 @@
+def db_load(da, ti):
+    client = mg.MongoClient("mongodb://localhost:27017/")
+    db = client["RSI_Test"]
+    upload = db[ti]
+    upload.insert_one(da)
+    client.close()
+
+
+class RsiSetup:
+    def __init__(self, data, ticker):
+        self.data = data
+        self.ticker = ticker
+        self.period = None
+        self.buy_point = None
+        self.sell_point = None
+        self.open = False
+        self.start_balance = 10000.00
+        self.buy_price = None
+        self.sale_price = None
+        self.share = None
+        self.logger = []
+        self.vig_log = []
+        self.t_dates = []
+        self.sell_dates = []
+        self.transact = []
+
+    def reset(self):
+        self.open = False
+        self.start_balance = 10000
+        self.buy_price = None
+        self.sale_price = None
+        self.share = None
+        self.logger = []
+        self.vig_log = []
+        self.t_dates = []
+        self.sell_dates = []
+        self.transact = []
+
+    def period_updater(self, m):
+        self.period = m
+
+    def bp_updater(self, b):
+        self.buy_point = b
+
+    def sel_updater(self, s):
+        self.sell_point = s
+
+    def buy(self, price, date):
+        self.t_dates.append(date.isoformat())
+        amount = self.start_balance / price
+        self.share = math.trunc(amount)
+        self.start_balance -= self.share * price
+        self.open = True
+        self.buy_price = price
+
+    def sell(self, price, date):
+        money = price * self.share
+        self.t_dates.append(date.isoformat())
+        self.start_balance += money
+        self.logger.append(self.start_balance)
+        self.vig_log.append((self.buy_price - price) / self.buy_price)
+        self.transact.append(1.0)
+        self.open = False
+        self.share = None
+        self.buy_price = None
+
+    def ris_calc(self, bar):
+        marker = self.data.index[bar]
+        data = self.data[: marker]
+        try:
+            if len(data) < self.period:
+                pass
+            else:
+                delta = data['Adj Close'].diff(1)
+                delta = delta.dropna()
+
+                pos = delta.copy()
+                neg = delta.copy()
+
+                pos[pos < 0] = 0
+                neg[neg > 0] = 0
+
+                avg_gain = pos.rolling(window=self.period).mean()
+                avg_loss = abs(neg.rolling(window=self.period).mean())
+
+                relative_strength = avg_gain / avg_loss
+
+                rsi = 100 - (100 / (1.0 + relative_strength))
+
+                rsi = rsi.dropna()
+
+                try:
+                    if self.open is False:
+                        if rsi.iloc[-1] > float(self.buy_point):
+                            self.buy(data.iloc[-1]['Adj Close'], data.index[-1])
+                        else:
+                            pass
+                    elif self.open is True:
+                        if rsi.iloc[-1] > float(self.sell_point):
+                            self.sell(data.iloc[-1]['Adj Close'], data.index[-1])
+                        else:
+                            pass
+                except IndexError:
+                    pass
+        except TypeError:
+            pass
+
+    def ticket_master(self):
+        try:
+            ods = len([o for o in self.vig_log if o > 0]) / len(self.vig_log)
+        except ZeroDivisionError:
+            ods = 0
+        try:
+            ret = (self.logger[-1] - 10000) / 10000
+        except IndexError:
+            ret = 0
+        export = {"Ticker": self.ticker,
+                  "odds": ods,
+                  "Lookback": self.period,
+                  "BuyLevel": self.buy_point,
+                  "SellLevel": self.sell_point,
+                  "Return": ret,
+                  "NumberOfTrades": sum(self.transact),
+                  "Data": {"TransactionDates": self.t_dates,
+                           "VigLog": self.vig_log,
+                           "ValueAction": self.logger}}
+        return export
